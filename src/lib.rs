@@ -27,9 +27,11 @@
     rustdoc::broken_intra_doc_links
 )]
 
-use std::{sync::Arc, sync::Barrier, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
+use tokio::sync::Barrier;
 
 use rand::prelude::*;
+use tokio::task::JoinSet;
 use tracing::{debug, info, info_span};
 
 /// A workload mix configration.
@@ -128,7 +130,7 @@ pub struct Workload {
 /// loop of the benchmark.
 pub trait Collection: Send + Sync + 'static {
     /// A thread-local handle to the concurrent collection under test.
-    type Handle: CollectionHandle;
+    type Handle: CollectionHandle + Send + 'static;
 
     /// Allocate a new instance of the benchmark target with the given capacity.
     fn with_capacity(capacity: usize) -> Self;
@@ -145,29 +147,29 @@ pub trait Collection: Send + Sync + 'static {
 pub trait CollectionHandle {
     /// The `u64` seeds used to construct `Key` (through `From<u64>`) are distinct.
     /// The returned keys must be as well.
-    type Key: From<u64>;
+    type Key: From<u64> + Send + Sync;
 
     /// Perform a lookup for `key`.
     ///
     /// Should return `true` if the key is found.
-    fn get(&mut self, key: &Self::Key) -> bool;
+    fn get(&mut self, key: &Self::Key) -> impl Future<Output = bool> + Send + Sync;
 
     /// Insert `key` into the collection.
     ///
     /// Should return `true` if no value previously existed for the key.
-    fn insert(&mut self, key: &Self::Key) -> bool;
+    fn insert(&mut self, key: &Self::Key) -> impl Future<Output = bool> + Send + Sync;
 
     /// Remove `key` from the collection.
     ///
     /// Should return `true` if the key existed and was removed.
-    fn remove(&mut self, key: &Self::Key) -> bool;
+    fn remove(&mut self, key: &Self::Key) -> impl Future<Output = bool> + Send + Sync;
 
     /// Update the value for `key` in the collection, if it exists.
     ///
     /// Should return `true` if the key existed and was updated.
     ///
     /// Should **not** insert the key if it did not exist.
-    fn update(&mut self, key: &Self::Key) -> bool;
+    fn update(&mut self, key: &Self::Key) -> impl Future<Output = bool> + Send + Sync;
 }
 
 /// Information about a measurement.
@@ -251,11 +253,11 @@ impl Workload {
     /// violated during the benchmark.
     ///
     /// Returns the seed used for the run.
-    pub fn run<T: Collection>(&self) -> [u8; 32]
+    pub async fn run<T: Collection>(&self) -> [u8; 32]
     where
         <T::Handle as CollectionHandle>::Key: Send + std::fmt::Debug,
     {
-        let m = self.run_silently::<T>();
+        let m = self.run_silently::<T>().await;
 
         // TODO: do more with this information
         // TODO: collect statistics per operation type
@@ -278,7 +280,7 @@ impl Workload {
     /// The key type must be `Debug` so that we can print meaningful errors if an assertion is
     /// violated during the benchmark.
     #[allow(clippy::cognitive_complexity)]
-    pub fn run_silently<T: Collection>(&self) -> Measurement
+    pub async fn run_silently<T: Collection>(&self) -> Measurement
     where
         <T::Handle as CollectionHandle>::Key: Send + std::fmt::Debug,
     {
@@ -320,55 +322,49 @@ impl Workload {
         // array "randomly".
         let insert_keys_per_thread =
             ((insert_keys + self.threads - 1) / self.threads).next_power_of_two();
-        let mut generators = Vec::new();
+        let mut generators = JoinSet::new();
         for _ in 0..self.threads {
             let mut thread_seed = [0u8; 32];
             rng.fill_bytes(&mut thread_seed[..]);
-            generators.push(std::thread::spawn(move || {
+            generators.spawn_blocking(move || {
                 let mut rng: rand::rngs::SmallRng = rand::SeedableRng::from_seed(thread_seed);
                 let mut keys: Vec<<T::Handle as CollectionHandle>::Key> =
                     Vec::with_capacity(insert_keys_per_thread);
                 keys.extend((0..insert_keys_per_thread).map(|_| rng.next_u64().into()));
                 keys
-            }));
+            });
         }
-        let keys: Vec<_> = generators
-            .into_iter()
-            .map(|jh| jh.join().unwrap())
-            .collect();
+        let keys: Vec<_> = generators.join_all().await;
 
         info!("constructing initial table");
         let table = Arc::new(T::with_capacity(initial_capacity));
 
         // And fill it
         let prefill_per_thread = prefill / self.threads;
-        let mut prefillers = Vec::new();
+        let mut prefillers = JoinSet::new();
         for keys in keys {
             let table = Arc::clone(&table);
-            prefillers.push(std::thread::spawn(move || {
+            prefillers.spawn(async move {
                 let mut table = table.pin();
                 for key in &keys[0..prefill_per_thread] {
-                    let inserted = table.insert(key);
+                    let inserted = table.insert(key).await;
                     assert!(inserted);
                 }
                 keys
-            }));
+            });
         }
-        let keys: Vec<_> = prefillers
-            .into_iter()
-            .map(|jh| jh.join().unwrap())
-            .collect();
+        let keys = prefillers.join_all().await;
 
         info!("start workload mix");
         let ops_per_thread = total_ops / self.threads;
         let op_mix = Arc::new(op_mix.into_boxed_slice());
-        let barrier = Arc::new(Barrier::new(self.threads + 1));
-        let mut mix_threads = Vec::with_capacity(self.threads);
+        let barrier = Arc::new(tokio::sync::Barrier::new(self.threads + 1));
+        let mut mix_threads = JoinSet::new();
         for keys in keys {
             let table = Arc::clone(&table);
             let op_mix = Arc::clone(&op_mix);
             let barrier = Arc::clone(&barrier);
-            mix_threads.push(std::thread::spawn(move || {
+            mix_threads.spawn(async move {
                 let mut table = table.pin();
                 mix(
                     &mut table,
@@ -378,18 +374,16 @@ impl Workload {
                     prefill_per_thread,
                     barrier,
                 )
-            }));
+                .await
+            });
         }
 
-        barrier.wait();
+        barrier.wait().await;
         let start = std::time::Instant::now();
-        barrier.wait();
+        barrier.wait().await;
         let spent = start.elapsed();
 
-        let _samples: Vec<_> = mix_threads
-            .into_iter()
-            .map(|jh| jh.join().unwrap())
-            .collect();
+        let _samples: Vec<_> = mix_threads.join_all().await;
 
         let avg = spent / total_ops as u32;
         info!(?spent, ops = total_ops, ?avg, "workload mix finished");
@@ -416,7 +410,7 @@ enum Operation {
     Upsert,
 }
 
-fn mix<H: CollectionHandle>(
+async fn mix<H: CollectionHandle>(
     tbl: &mut H,
     keys: &[H::Key],
     op_mix: &[Operation],
@@ -444,9 +438,9 @@ fn mix<H: CollectionHandle>(
 
     // The elapsed time is measured by the lifetime of `workload_scope`.
     let workload_scope = scopeguard::guard(barrier, |barrier| {
-        barrier.wait();
+        tokio::runtime::Handle::current().spawn(async move { barrier.wait().await });
     });
-    workload_scope.wait();
+    workload_scope.wait().await;
 
     for (i, op) in (0..((ops + op_mix.len() - 1) / op_mix.len()))
         .flat_map(|_| op_mix.iter())
@@ -459,7 +453,7 @@ fn mix<H: CollectionHandle>(
         match op {
             Operation::Read => {
                 let should_find = find_seq >= erase_seq && find_seq < insert_seq;
-                let found = tbl.get(&keys[find_seq]);
+                let found = tbl.get(&keys[find_seq]).await;
                 if find_seq >= erase_seq {
                     assert_eq!(
                         should_find, found,
@@ -474,7 +468,7 @@ fn mix<H: CollectionHandle>(
                 find_seq = (a * find_seq + c) & find_seq_mask;
             }
             Operation::Insert => {
-                let new_key = tbl.insert(&keys[insert_seq]);
+                let new_key = tbl.insert(&keys[insert_seq]).await;
                 assert!(
                     new_key,
                     "insert({:?}) should insert a new value",
@@ -485,7 +479,7 @@ fn mix<H: CollectionHandle>(
             Operation::Remove => {
                 if erase_seq == insert_seq {
                     // If `erase_seq` == `insert_eq`, the table should be empty.
-                    let removed = tbl.remove(&keys[find_seq]);
+                    let removed = tbl.remove(&keys[find_seq]).await;
                     assert!(
                         !removed,
                         "remove({:?}) succeeded on empty table",
@@ -495,7 +489,7 @@ fn mix<H: CollectionHandle>(
                     // Twist the LCG since we used find_seq
                     find_seq = (a * find_seq + c) & find_seq_mask;
                 } else {
-                    let removed = tbl.remove(&keys[erase_seq]);
+                    let removed = tbl.remove(&keys[erase_seq]).await;
                     assert!(removed, "remove({:?}) should succeed", &keys[erase_seq]);
                     erase_seq += 1;
                 }
@@ -503,7 +497,7 @@ fn mix<H: CollectionHandle>(
             Operation::Update => {
                 // Same as find, except we update to the same default value
                 let should_exist = find_seq >= erase_seq && find_seq < insert_seq;
-                let updated = tbl.update(&keys[find_seq]);
+                let updated = tbl.update(&keys[find_seq]).await;
                 if find_seq >= erase_seq {
                     assert_eq!(should_exist, updated, "update({:?})", &keys[find_seq]);
                 } else {
@@ -521,7 +515,7 @@ fn mix<H: CollectionHandle>(
                 // Twist the LCG since we used find_seq
                 find_seq = (a * find_seq + c) & find_seq_mask;
 
-                let _inserted = tbl.insert(&keys[n]);
+                let _inserted = tbl.insert(&keys[n]).await;
                 if n == insert_seq {
                     insert_seq += 1;
                 }

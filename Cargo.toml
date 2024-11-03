@@ -15,6 +15,7 @@ categories = ["concurrency", "development-tools::profiling", "development-tools:
 [dependencies]
 rand = { version = "0.8", features = ["small_rng"] }
 scopeguard = "1"
+tokio = { version = "1.41.0", features = ["full"] }
 tracing = { version = "0.1", features = ["std"], default-features = false }
 
 [dev-dependencies]
